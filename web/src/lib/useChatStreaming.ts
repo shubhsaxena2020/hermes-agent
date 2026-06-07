@@ -2,33 +2,27 @@
  * useChatStreaming — bridge the assistant-ui widget to the existing
  * tui_gateway over /api/ws.
  *
- * Architecture (verified against repo source):
- *   - tui_gateway/ws.py serves a JSON-RPC dialect identical to Ink's stdio
- *   - tui_gateway/server.py:4342 exposes `@method("prompt.submit")` which
- *     takes {session_id, text}, lazily builds an AIAgent for the session,
- *     starts the turn, returns {status: "streaming"} immediately, and
- *     fans events back over the same WebSocket
- *   - web/src/lib/gatewayClient.ts already implements the client side
- *     (auth, JSON-RPC framing, event subscription, request/response
- *     correlation) — we reuse it as-is
+ * v2 adds: approval/clarify/sudo/secret prompt handling, reasoning + thinking
+ * stream, mid-turn cancel via session.interrupt, exponential-backoff reconnect
+ * with session.resume re-attach, and a manual-retry escape hatch.
  *
- * What this hook does on top:
- *   - lazy-opens one GatewayClient per session id
- *   - calls session.resume on connect so prompt.submit binds to the
- *     correct session row
- *   - accumulates message.delta frames into a single streamingMessage
- *     that the widget renders as a live assistant bubble
- *   - tracks in-flight tool calls from tool.start / tool.complete events
- *     and surfaces them as ToolEntry[] on the streaming message
- *   - exposes a single boolean `isStreaming` so the composer can disable
- *     itself between turns
+ * Verified against the gateway (commit 2d08047):
+ *   prompt.submit       (server.py:4342)  → starts a turn, streams events
+ *   session.resume      (server.py:3276)  → attaches to an existing session
+ *   session.interrupt   (server.py:4059)  → cancels in-flight turn
+ *   clarify.respond     (server.py:5609)  → {request_id, answer}
+ *   sudo.respond        (server.py:5614)  → {request_id, password}
+ *   secret.respond      (server.py:5619)  → {request_id, value}
+ *   approval.respond    (server.py:5624)  → {session_id, choice, all?}
+ *                                            (routes via tools/approval, NOT
+ *                                            via request_id like the others)
+ *   slash.exec          (server.py:7672)  → {session_id, command}
+ *   complete.slash      (server.py:7368)  → {text} → {items: [...]}
+ *   image.attach_bytes  (server.py:5189)  → {session_id, content_base64, ...}
  *
- * What's deliberately out of scope for v1:
- *   - approval / clarify / sudo / secret request modals (gateway emits
- *     them; we ignore for now and the user can hit `terminal` toggle if
- *     a turn stalls waiting for one)
- *   - reasoning.delta streaming UI
- *   - reconnection logic — drop on the floor for now, user reloads
+ * Out of scope (still): mid-turn streaming reasoning toggle UI, slash command
+ * pager output, multi-attachment thumbnails — all the gaps that need real
+ * design rather than just wire-up.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -42,20 +36,86 @@ export interface StreamingMessage {
   tools: ToolEntry[];
 }
 
+export type PendingPrompt =
+  | {
+      kind: "approval";
+      requestId: string;
+      payload: {
+        command?: string;
+        description?: string;
+        pattern_keys?: string[];
+        [k: string]: unknown;
+      };
+    }
+  | {
+      kind: "clarify";
+      requestId: string;
+      payload: { question?: string; choices?: string[]; [k: string]: unknown };
+    }
+  | {
+      kind: "sudo";
+      requestId: string;
+      payload: Record<string, unknown>;
+    }
+  | {
+      kind: "secret";
+      requestId: string;
+      payload: {
+        prompt?: string;
+        env_var?: string;
+        metadata?: Record<string, unknown>;
+        [k: string]: unknown;
+      };
+    };
+
+export type ConnectionStatus =
+  | { kind: "idle" }
+  | { kind: "connecting" }
+  | { kind: "ready" }
+  | { kind: "reconnecting"; attempt: number; nextRetryMs: number }
+  | { kind: "failed"; reason: string };
+
 export interface ChatStreamingState {
-  /** Assistant message currently being streamed, or null between turns. */
   streamingMessage: StreamingMessage | null;
-  /** True while a turn is in flight. Composer should disable input. */
+  reasoningText: string;
   isStreaming: boolean;
-  /** Last error from the gateway, if any. Cleared on next successful submit. */
   error: string | null;
-  /** True once the gateway WebSocket is open and session.resume succeeded. */
+  pendingPrompt: PendingPrompt | null;
+  connectionStatus: ConnectionStatus;
+  /** True when the gateway WS is open AND session.resume succeeded. */
   ready: boolean;
-  /** Send a new user message. Resolves when the turn completes (or errors). */
   sendMessage: (text: string) => Promise<void>;
-  /** Manual reset of the per-turn state — used after the parent commits
-   *  the streamed assistant message into its own history. */
+  cancelTurn: () => Promise<void>;
+  respondToPrompt: (answer: string) => Promise<void>;
+  respondToApproval: (choice: "allow" | "deny", all?: boolean) => Promise<void>;
+  manualRetry: () => void;
   clearStreamingMessage: () => void;
+  /** Run a slash command. Routes through slash.exec (separate from prompt.submit). */
+  runSlash: (command: string) => Promise<unknown>;
+  /** Fetch slash-command completions for the popover. Empty array on error. */
+  completeSlash: (text: string) => Promise<SlashCompletion[]>;
+  /** Upload an image to the session. Returns the gateway's metadata so the
+   *  caller can build a thumbnail; the image is auto-included on the next
+   *  prompt.submit. */
+  attachImageBytes: (
+    base64: string,
+    opts?: { filename?: string },
+  ) => Promise<AttachmentMeta>;
+}
+
+export interface SlashCompletion {
+  text: string;
+  display: string;
+  meta: string;
+}
+
+export interface AttachmentMeta {
+  attached: boolean;
+  path: string;
+  count: number;
+  text?: string;
+  width?: number;
+  height?: number;
 }
 
 interface ToolStartPayload {
@@ -73,7 +133,9 @@ interface ToolCompletePayload {
   error?: string;
 }
 
-/** Best-effort short context line from tool args (mirror of converter logic). */
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 30_000];
+
 function argsToContext(args: unknown): string {
   if (!args || typeof args !== "object" || Array.isArray(args)) return "";
   const parts: string[] = [];
@@ -87,44 +149,46 @@ function argsToContext(args: unknown): string {
   return parts.join(", ");
 }
 
-/** Resolve the tool id from a tool.* event payload — accepts both `id` and
- *  `tool_id` since different code paths in the gateway use different keys. */
 function pickToolId(p: ToolStartPayload | ToolCompletePayload): string | null {
   return (p.tool_id ?? p.id) || null;
 }
 
 export function useChatStreaming(sessionId: string | null | undefined): ChatStreamingState {
   const [streamingMessage, setStreamingMessage] = useState<StreamingMessage | null>(null);
+  const [reasoningText, setReasoningText] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [ready, setReady] = useState(false);
+  const [pendingPrompt, setPendingPrompt] = useState<PendingPrompt | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>({ kind: "idle" });
 
-  // Refs survive re-renders without re-subscribing.
   const gwRef = useRef<GatewayClient | null>(null);
-  const currentTurnIdRef = useRef<string | null>(null);
-  // Resolver/rejector for the in-flight sendMessage() promise. Cleared on
-  // message.complete or error.
   const turnResolverRef = useRef<{ resolve: () => void; reject: (e: Error) => void } | null>(null);
+  // Bumping this token triggers the connect effect to retry. Used for both
+  // manual retries and the auto-reconnect timer callback.
+  const [retryToken, setRetryToken] = useState(0);
+  const reconnectAttemptRef = useRef(0);
 
-  // Open + bind the gateway once per sessionId.
+  // Open + bind the gateway. Re-runs when sessionId changes or retryToken bumps.
   useEffect(() => {
     if (!sessionId) {
-      setReady(false);
+      setConnectionStatus({ kind: "idle" });
       return;
     }
 
     let cancelled = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     const gw = new GatewayClient();
     gwRef.current = gw;
+    setConnectionStatus({ kind: "connecting" });
 
-    // Subscribe BEFORE connecting so we don't miss the initial gateway.ready.
     const unsubscribers: Array<() => void> = [];
 
+    // ── streaming events ─────────────────────────────────────────────
     unsubscribers.push(
       gw.on("message.start", () => {
         const id = `stream-${Date.now()}`;
-        currentTurnIdRef.current = id;
         setStreamingMessage({ id, text: "", tools: [] });
+        setReasoningText("");
       }),
     );
 
@@ -143,8 +207,6 @@ export function useChatStreaming(sessionId: string | null | undefined): ChatStre
         setIsStreaming(false);
         turnResolverRef.current?.resolve();
         turnResolverRef.current = null;
-        // Leave streamingMessage in state — the parent commits it then
-        // calls clearStreamingMessage().
       }),
     );
 
@@ -195,6 +257,37 @@ export function useChatStreaming(sessionId: string | null | undefined): ChatStre
       }),
     );
 
+    // ── reasoning / thinking ─────────────────────────────────────────
+    const onReasoningDelta = (ev: GatewayEvent<{ text?: string }>) => {
+      const delta = ev.payload?.text ?? "";
+      if (!delta) return;
+      setReasoningText((prev) => prev + delta);
+    };
+    unsubscribers.push(gw.on("reasoning.delta", onReasoningDelta));
+    unsubscribers.push(gw.on("thinking.delta", onReasoningDelta));
+    unsubscribers.push(
+      gw.on("reasoning.available", (ev: GatewayEvent<{ text?: string }>) => {
+        const t = ev.payload?.text ?? "";
+        if (t && t !== reasoningText) setReasoningText(t);
+      }),
+    );
+
+    // ── interactive prompts ──────────────────────────────────────────
+    type PromptPayload = { request_id?: string } & Record<string, unknown>;
+    const onPromptRequest = (kind: PendingPrompt["kind"]) => (ev: GatewayEvent<PromptPayload>) => {
+      const p = ev.payload ?? {};
+      const requestId = String(p.request_id ?? "");
+      // approval flow uses session_key, not request_id; keep requestId
+      // for the other three so respondToPrompt can echo it back.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      setPendingPrompt({ kind, requestId, payload: p } as any);
+    };
+    unsubscribers.push(gw.on("approval.request", onPromptRequest("approval")));
+    unsubscribers.push(gw.on("clarify.request", onPromptRequest("clarify")));
+    unsubscribers.push(gw.on("sudo.request", onPromptRequest("sudo")));
+    unsubscribers.push(gw.on("secret.request", onPromptRequest("secret")));
+
+    // ── errors ───────────────────────────────────────────────────────
     unsubscribers.push(
       gw.on("error", (ev: GatewayEvent<{ message?: string }>) => {
         const msg = ev.payload?.message ?? "gateway error";
@@ -205,32 +298,66 @@ export function useChatStreaming(sessionId: string | null | undefined): ChatStre
       }),
     );
 
+    // ── connection-state transitions: handle drops + reconnect ───────
+    const unsubState = gw.onState((s) => {
+      if (cancelled) return;
+      if (s === "closed" || s === "error") {
+        // If we were "ready" or "connecting", the WS dropped. Try to reconnect.
+        const attempt = reconnectAttemptRef.current + 1;
+        if (attempt > MAX_RECONNECT_ATTEMPTS) {
+          setConnectionStatus({
+            kind: "failed",
+            reason: "Connection lost — click to retry",
+          });
+          return;
+        }
+        const delay = RECONNECT_DELAYS_MS[Math.min(attempt - 1, RECONNECT_DELAYS_MS.length - 1)];
+        reconnectAttemptRef.current = attempt;
+        setConnectionStatus({ kind: "reconnecting", attempt, nextRetryMs: delay });
+        reconnectTimer = setTimeout(() => {
+          if (!cancelled) setRetryToken((t) => t + 1);
+        }, delay);
+      }
+    });
+    unsubscribers.push(unsubState);
+
     gw.connect()
       .then(async () => {
         if (cancelled) return;
         try {
           await gw.request("session.resume", { session_id: sessionId });
-          if (!cancelled) setReady(true);
+          if (cancelled) return;
+          reconnectAttemptRef.current = 0;
+          setConnectionStatus({ kind: "ready" });
+          setError(null);
         } catch (e) {
-          if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+          if (!cancelled) {
+            setError(e instanceof Error ? e.message : String(e));
+            setConnectionStatus({
+              kind: "failed",
+              reason: "session.resume failed: " + (e instanceof Error ? e.message : String(e)),
+            });
+          }
         }
       })
-      .catch((e: unknown) => {
-        if (!cancelled) {
-          setError(e instanceof Error ? e.message : String(e));
-        }
+      .catch(() => {
+        // Open failed — the onState("error"/"closed") branch will schedule a retry.
       });
 
     return () => {
       cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       for (const u of unsubscribers) u();
       gw.close();
       gwRef.current = null;
-      setReady(false);
-      setStreamingMessage(null);
-      setIsStreaming(false);
     };
-  }, [sessionId]);
+  // We deliberately exclude reasoningText from deps — it's referenced inside
+  // reasoning.available handler only to skip duplicate full-text emissions,
+  // and re-subscribing on every delta would be a perf bug.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, retryToken]);
+
+  const ready = connectionStatus.kind === "ready";
 
   const sendMessage = useCallback(
     (text: string): Promise<void> => {
@@ -241,6 +368,7 @@ export function useChatStreaming(sessionId: string | null | undefined): ChatStre
       if (isStreaming) return Promise.reject(new Error("turn already in progress"));
 
       setError(null);
+      setReasoningText("");
       setStreamingMessage({ id: `stream-${Date.now()}`, text: "", tools: [] });
       setIsStreaming(true);
 
@@ -263,17 +391,140 @@ export function useChatStreaming(sessionId: string | null | undefined): ChatStre
     [sessionId, isStreaming, ready],
   );
 
+  const cancelTurn = useCallback(async (): Promise<void> => {
+    if (!gwRef.current || !sessionId) return;
+    if (!isStreaming) return;
+    try {
+      await gwRef.current.request("session.interrupt", { session_id: sessionId });
+    } catch (e) {
+      // Best-effort. The interrupt may race with completion; surface error
+      // only if it's not the benign "no session" case.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/no session|not found/i.test(msg)) setError(msg);
+    } finally {
+      setIsStreaming(false);
+      turnResolverRef.current?.resolve();
+      turnResolverRef.current = null;
+    }
+  }, [sessionId, isStreaming]);
+
+  const respondToPrompt = useCallback(
+    async (answer: string): Promise<void> => {
+      if (!gwRef.current || !pendingPrompt || !sessionId) return;
+      const method =
+        pendingPrompt.kind === "clarify"
+          ? "clarify.respond"
+          : pendingPrompt.kind === "sudo"
+          ? "sudo.respond"
+          : "secret.respond";
+      const key =
+        pendingPrompt.kind === "clarify"
+          ? "answer"
+          : pendingPrompt.kind === "sudo"
+          ? "password"
+          : "value";
+      try {
+        await gwRef.current.request(method, {
+          session_id: sessionId,
+          request_id: pendingPrompt.requestId,
+          [key]: answer,
+        });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setPendingPrompt(null);
+      }
+    },
+    [pendingPrompt, sessionId],
+  );
+
+  const respondToApproval = useCallback(
+    async (choice: "allow" | "deny", all = false): Promise<void> => {
+      if (!gwRef.current || !sessionId) return;
+      try {
+        await gwRef.current.request("approval.respond", {
+          session_id: sessionId,
+          choice,
+          all,
+        });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setPendingPrompt(null);
+      }
+    },
+    [sessionId],
+  );
+
+  const manualRetry = useCallback(() => {
+    reconnectAttemptRef.current = 0;
+    setError(null);
+    setRetryToken((t) => t + 1);
+  }, []);
+
   const clearStreamingMessage = useCallback(() => {
     setStreamingMessage(null);
-    currentTurnIdRef.current = null;
   }, []);
+
+  const runSlash = useCallback(
+    async (command: string): Promise<unknown> => {
+      if (!gwRef.current || !sessionId || !ready) {
+        throw new Error("gateway not ready");
+      }
+      return gwRef.current.request("slash.exec", { session_id: sessionId, command });
+    },
+    [sessionId, ready],
+  );
+
+  const completeSlash = useCallback(
+    async (text: string): Promise<SlashCompletion[]> => {
+      if (!gwRef.current || !ready) return [];
+      try {
+        const res = (await gwRef.current.request("complete.slash", { text })) as {
+          items?: SlashCompletion[];
+        };
+        return res?.items ?? [];
+      } catch {
+        return [];
+      }
+    },
+    [ready],
+  );
+
+  const attachImageBytes = useCallback(
+    async (
+      base64: string,
+      opts?: { filename?: string },
+    ): Promise<AttachmentMeta> => {
+      if (!gwRef.current || !sessionId || !ready) {
+        throw new Error("gateway not ready");
+      }
+      const params: Record<string, unknown> = {
+        session_id: sessionId,
+        content_base64: base64,
+      };
+      if (opts?.filename) params.filename = opts.filename;
+      return (await gwRef.current.request("image.attach_bytes", params)) as AttachmentMeta;
+    },
+    [sessionId, ready],
+  );
 
   return {
     streamingMessage,
+    reasoningText,
     isStreaming,
     error,
+    pendingPrompt,
+    connectionStatus,
     ready,
     sendMessage,
+    cancelTurn,
+    respondToPrompt,
+    respondToApproval,
+    manualRetry,
     clearStreamingMessage,
+    runSlash,
+    completeSlash,
+    attachImageBytes,
   };
 }
