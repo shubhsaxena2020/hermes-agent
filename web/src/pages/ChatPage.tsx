@@ -134,6 +134,26 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   );
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Brief floating "Copied!" toast for the Ctrl+C-with-selection path.
+  // Defined as a ref so the xterm keydown handler (closed-over in a
+  // useEffect that intentionally doesn't depend on this state) can call it
+  // without going stale.
+  const [copyToastVisible, setCopyToastVisible] = useState(false);
+  const copyToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showCopiedToastRef = useRef<(() => void) | null>(null);
+  showCopiedToastRef.current = () => {
+    setCopyToastVisible(true);
+    if (copyToastTimerRef.current) clearTimeout(copyToastTimerRef.current);
+    copyToastTimerRef.current = setTimeout(
+      () => setCopyToastVisible(false),
+      1500,
+    );
+  };
+  useEffect(() => {
+    return () => {
+      if (copyToastTimerRef.current) clearTimeout(copyToastTimerRef.current);
+    };
+  }, []);
   // ── Terminal ↔ Widget toggle ────────────────────────────────────────────
   // Persisted in localStorage so an explicit user choice sticks across reloads.
   // Default behaviour when no prior choice exists:
@@ -399,31 +419,38 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
 
-      // Copy: Cmd+C on macOS, Ctrl+Shift+C on other platforms. Bare Ctrl+C
-      // is reserved for SIGINT to the TUI child — matches xterm / gnome-terminal /
-      // konsole / Windows Terminal. Ctrl+Shift+C only copies if a selection exists;
-      // without a selection it passes through to the TUI so agents can still
-      // react to the keypress.
-      // Paste: Cmd+Shift+V on macOS, Ctrl+Shift+V on others.
-      const copyModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
+      // Copy precedence:
+      //   1. Bare Ctrl+C (Linux/Windows) / Cmd+C (macOS) WITH selection → copy
+      //      and DO NOT pass through to the TUI. This intentionally diverges
+      //      from the xterm/gnome-terminal default (bare Ctrl+C = SIGINT
+      //      always) because most users in this dashboard expect the
+      //      VSCode/iTerm-style "copy when selected" UX.
+      //   2. Ctrl+Shift+C → same copy semantics, kept for users who learned
+      //      the classic Unix convention.
+      //   3. Bare Ctrl+C with NO selection → pass through to TUI as SIGINT.
+      //   4. Paste: Cmd+Shift+V on macOS, Ctrl+Shift+V on others.
+      const isCopyKey = ev.key.toLowerCase() === "c";
+      const bareCopyChord = isMac ? ev.metaKey && !ev.shiftKey : ev.ctrlKey && !ev.shiftKey;
+      const shiftCopyChord = isMac ? ev.metaKey && ev.shiftKey : ev.ctrlKey && ev.shiftKey;
       const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey && ev.shiftKey;
 
-      if (copyModifier && ev.key.toLowerCase() === "c") {
+      if (isCopyKey && (bareCopyChord || shiftCopyChord)) {
         const sel = term.getSelection();
         if (sel) {
           // Direct writeText inside the keydown handler preserves the user
           // gesture — async round-trips through OSC 52 can lose activation
           // and fail with "Document is not focused".
-          navigator.clipboard.writeText(sel).catch((err) => {
-            console.warn("[dashboard clipboard] direct copy failed:", err.message);
-          });
-          // Clear xterm.js's highlight after copy (matches gnome-terminal).
+          navigator.clipboard.writeText(sel).then(
+            () => showCopiedToastRef.current?.(),
+            (err) => console.warn("[dashboard clipboard] direct copy failed:", err.message),
+          );
           term.clearSelection();
           ev.preventDefault();
           return false;
         }
-        // No selection → fall through so the TUI receives Ctrl+Shift+C
-        // (or the bare ev if the user used a different modifier).
+        // Bare Ctrl+C with no selection → fall through so TUI gets SIGINT.
+        // Ctrl+Shift+C with no selection → also fall through (TUI may want
+        // the chord, though most agents ignore it).
       }
 
       if (pasteModifier && ev.key.toLowerCase() === "v") {
@@ -978,6 +1005,23 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               </span>
             </span>
           </Button>
+
+          {/* Floating toast for the Ctrl+C-with-selection copy path.
+              Positioned bottom-right inside the terminal pane so it
+              shows up exactly where the user just released their drag. */}
+          <div
+            role="status"
+            aria-live="polite"
+            className={cn(
+              "pointer-events-none absolute bottom-12 right-3 z-20 rounded-md border px-2 py-1 text-xs",
+              "border-current/30 bg-black/60 backdrop-blur-sm",
+              "transition-opacity duration-150",
+              copyToastVisible ? "opacity-100" : "opacity-0",
+            )}
+            style={{ color: TERMINAL_THEME_STATIC.foreground }}
+          >
+            Copied!
+          </div>
         </div>
 
         {!narrow && (

@@ -21,8 +21,10 @@ import {
 } from "@assistant-ui/react";
 import {
   Brain,
+  Check,
   ChevronDown,
   ChevronRight,
+  Copy,
   Paperclip,
   Send,
   X as XIcon,
@@ -86,10 +88,67 @@ function TextPart() {
   return <Markdown content={text} />;
 }
 
+/** Hover-only copy button placed in a bubble's top-right corner.
+ *  Reads the full markdown text out of the assistant-ui MessageState so
+ *  the copy is whatever the model actually wrote, not the rendered HTML. */
+function MessageCopyButton({ alignRight = false }: { alignRight?: boolean }) {
+  const message = useMessage();
+  const [copied, setCopied] = useState(false);
+  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
+    };
+  }, []);
+
+  const onCopy = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    // Drop preventDefault so the click still ends any in-progress text drag.
+    const parts = (message.content ?? []) as Array<{ type: string; text?: string }>;
+    const text = parts
+      .filter((p) => p.type === "text" && typeof p.text === "string")
+      .map((p) => p.text as string)
+      .join("\n\n")
+      .trim();
+    if (!text) return;
+    void navigator.clipboard.writeText(text).then(
+      () => {
+        setCopied(true);
+        if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
+        resetTimerRef.current = setTimeout(() => setCopied(false), 2000);
+      },
+      () => {
+        // Clipboard write failed (permission / not focused). Surface nothing —
+        // the user will retry. We deliberately do not show a noisy toast.
+      },
+    );
+  };
+
+  const Icon = copied ? Check : Copy;
+  // `select-none` so dragging across the button doesn't break a text
+  // selection started elsewhere in the bubble.
+  const positional = alignRight
+    ? "right-1.5"
+    : "left-1.5";
+  return (
+    <button
+      type="button"
+      onClick={onCopy}
+      aria-label={copied ? "Copied" : "Copy message"}
+      title={copied ? "Copied" : "Copy message"}
+      className={`absolute top-1.5 ${positional} z-10 flex h-6 w-6 select-none items-center justify-center rounded-md border border-border/60 bg-background/70 text-muted-foreground opacity-0 backdrop-blur-sm transition-opacity duration-150 hover:bg-background hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100`}
+    >
+      <Icon className="h-3 w-3" />
+    </button>
+  );
+}
+
 function UserMessage() {
   return (
-    <MessagePrimitive.Root className="flex justify-end">
-      <div className="max-w-[80%] rounded-2xl border border-primary/30 bg-primary/10 px-4 py-2 text-foreground">
+    <MessagePrimitive.Root className="group flex justify-end">
+      <div className="relative max-w-[80%] select-text rounded-2xl border border-primary/30 bg-primary/10 px-4 py-2 text-foreground">
+        <MessageCopyButton />
         <MessagePrimitive.Parts components={{ Text: TextPart }} />
       </div>
     </MessagePrimitive.Root>
@@ -101,8 +160,9 @@ function AssistantMessage() {
   const toolEntries = useContext(ToolEntriesContext);
   const entries = (message.id && toolEntries.get(message.id)) || [];
   return (
-    <MessagePrimitive.Root className="flex justify-start">
-      <div className="flex max-w-[80%] flex-col gap-2 rounded-2xl border border-border bg-muted/30 px-4 py-3">
+    <MessagePrimitive.Root className="group flex justify-start">
+      <div className="relative flex max-w-[80%] select-text flex-col gap-2 rounded-2xl border border-border bg-muted/30 px-4 py-3">
+        <MessageCopyButton alignRight />
         <MessagePrimitive.Parts components={{ Text: TextPart }} />
         {entries.length > 0 && (
           <div className="flex flex-col gap-1.5">
