@@ -135,15 +135,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // ── Terminal ↔ Widget toggle ────────────────────────────────────────────
-  // Persisted in localStorage so the user's preference sticks across reloads.
-  // Default 'terminal' (preserve historic behaviour); the widget is opt-in
-  // for now since it's read-only until the streaming backend lands.
+  // Persisted in localStorage so an explicit user choice sticks across reloads.
+  // Default behaviour when no prior choice exists:
+  //   - resuming a session (?resume=)  → 'widget'  (the rich UI is the
+  //                                       expected entry point from "Resume
+  //                                       in Chat" on the Sessions page)
+  //   - opening /chat fresh            → 'terminal' (preserves the historic
+  //                                       chat-from-scratch experience until
+  //                                       streaming input lands)
   // The toggle UI is only rendered when a resume= session ID is present —
   // outside that context the widget has nothing useful to show.
+  const resumeParam = searchParams.get("resume");
   const [chatMode, setChatMode] = useState<"terminal" | "widget">(() => {
     if (typeof window === "undefined") return "terminal";
     const stored = window.localStorage.getItem("hermesChatMode");
-    return stored === "widget" ? "widget" : "terminal";
+    if (stored === "widget" || stored === "terminal") return stored;
+    return resumeParam ? "widget" : "terminal";
   });
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -188,7 +195,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // Sessions page relies on `/chat?resume=<id>` changing at runtime, so we must
   // treat the current resume target as part of the PTY identity and rebuild the
   // terminal session when it changes.
-  const resumeParam = searchParams.get("resume");
+  // resumeParam declared earlier (used by the terminal/widget toggle default).
   const channel = useMemo(() => generateChannelId(), [resumeParam]);
 
   useEffect(() => {
