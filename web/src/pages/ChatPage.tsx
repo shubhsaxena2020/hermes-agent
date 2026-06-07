@@ -32,6 +32,7 @@ import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
+import ChatWidgetPage from "@/pages/ChatWidgetPage";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
@@ -133,6 +134,21 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   );
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // ── Terminal ↔ Widget toggle ────────────────────────────────────────────
+  // Persisted in localStorage so the user's preference sticks across reloads.
+  // Default 'terminal' (preserve historic behaviour); the widget is opt-in
+  // for now since it's read-only until the streaming backend lands.
+  // The toggle UI is only rendered when a resume= session ID is present —
+  // outside that context the widget has nothing useful to show.
+  const [chatMode, setChatMode] = useState<"terminal" | "widget">(() => {
+    if (typeof window === "undefined") return "terminal";
+    const stored = window.localStorage.getItem("hermesChatMode");
+    return stored === "widget" ? "widget" : "terminal";
+  });
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("hermesChatMode", chatMode);
+  }, [chatMode]);
   // Raw state for the mobile side-sheet + a derived value that force-
   // closes whenever the chat tab isn't active.  The *derived* value is
   // what side-effects (body-scroll lock, keydown listener, portal render)
@@ -880,10 +896,56 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
           }}
         >
+          {/* xterm host — kept mounted in both modes so toggling back to
+              terminal doesn't reconnect the PTY. display:none on widget
+              mode hides it without unmounting. */}
           <div
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
+            style={{
+              display:
+                chatMode === "widget" && resumeParam ? "none" : undefined,
+            }}
           />
+          {chatMode === "widget" && resumeParam && (
+            <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
+              <ChatWidgetPage sessionId={resumeParam} showHeader={false} />
+            </div>
+          )}
+
+          {/* Terminal ↔ Widget toggle — only when a session is resumed. */}
+          {resumeParam && (
+            <div
+              className={cn(
+                "absolute top-2 left-2 z-10 flex gap-0.5 rounded border border-current/30",
+                "bg-black/20 backdrop-blur-sm",
+                "opacity-70 hover:opacity-100",
+                "transition-opacity duration-150",
+                "lg:top-4 lg:left-4",
+              )}
+              role="group"
+              aria-label="Chat rendering mode"
+              style={{ color: TERMINAL_THEME_STATIC.foreground }}
+            >
+              {(["terminal", "widget"] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setChatMode(m)}
+                  aria-pressed={chatMode === m}
+                  className={cn(
+                    "px-2 py-1 text-xs tracking-wide rounded-sm",
+                    "transition-colors duration-150",
+                    chatMode === m
+                      ? "bg-white/15 font-medium"
+                      : "hover:bg-white/5",
+                  )}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          )}
 
           <Button
             ghost
